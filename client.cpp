@@ -306,12 +306,13 @@ void get_current_time(char *now_time) {
 		return;
 	}
 
-	sprintf(now_time, "%04d-%02d-%02d %02d:%02d.%03ld",
+	sprintf(now_time, "%04d-%02d-%02d %02d:%02d:%02d.%03ld",
 			tm_info->tm_year + 1900, // Year since 1900
 			tm_info->tm_mon + 1,     // Month (0-11)
 			tm_info->tm_mday,        // Day of the month (1-31)
 			tm_info->tm_hour,        // Hour (0-23)
 			tm_info->tm_min,         // Minute (0-59)
+			tm_info->tm_sec,
 			(long) (ts.tv_nsec / 1000000)); // Milliseconds
 }
 
