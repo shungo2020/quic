@@ -36,15 +36,24 @@ typedef struct server_ctx_s {
 	struct event *ev_socket;
 	struct sockaddr local_addr;
 	socklen_t local_addr_len;
+
+	bool reverse;
 } server_ctx_t;
 
 typedef struct conn_ctx_s {
 	server_ctx_s *server_ctx;
 	const xqc_cid_t *cid;
-	xqc_stream_t *stream;
 	struct sockaddr remote_addr;
 	socklen_t remote_addr_len;
 } conn_ctx_t;
+
+
+typedef struct stream_ctx_s {
+	xqc_stream_t *stream;
+	bool write; // write to client 
+	conn_ctx_t* conn_ctx;
+	int state;  //0: wait header 1: write or read
+} stream_ctx_t;
 
 void xqc_log(xqc_log_level_t lvl, const void *buf, size_t count, void *engine_user_data)
 {
@@ -111,10 +120,11 @@ void xqc_server_socket_event_callback(int fd, short what, void *arg) {
 									  &peer_addr, peer_addrlen,
 									  xqc_now(), ctx) != XQC_OK) {
 				return;
-			} 
+			}
+			xqc_engine_finish_recv(ctx->engine);
 		}
 
-		xqc_engine_finish_recv(ctx->engine);
+
 	}
 }
 
@@ -146,6 +156,32 @@ ssize_t xqc_server_write_socket(const unsigned char *buf, size_t size, const str
 	return res;
 }
 
+ssize_t xqc_server_write_mmsg(const struct iovec *msg_iov, unsigned int vlen, const struct sockaddr *peer_addr, socklen_t peer_addrlen, void *conn_user_data)
+{
+	conn_ctx_t *ctx = (conn_ctx_t *)conn_user_data;
+	struct mmsghdr msgs[vlen];
+	ssize_t res = 0;
+	for (unsigned int i = 0; i < vlen; ++i)
+	{
+		memset(&msgs[i], 0, sizeof(struct mmsghdr));
+		msgs[i].msg_hdr.msg_name = (struct sockaddr *)peer_addr;
+		msgs[i].msg_hdr.msg_namelen = peer_addrlen;
+		msgs[i].msg_hdr.msg_iov = const_cast<struct iovec *>(msg_iov + i);
+		msgs[i].msg_hdr.msg_iovlen = 1;
+	}
+	do {
+		errno = 0;
+		res = sendmmsg(ctx->server_ctx->fd, msgs, vlen, 0);
+		if (res < 0)
+		{
+			if (errno == EAGAIN)
+				res = XQC_SOCKET_EAGAIN;
+		}
+	} while ((res < 0) && (errno == EINTR));
+
+	return res;
+}
+
 void xqc_server_conn_update_cid_notify(xqc_connection_t *conn, const xqc_cid_t *retire_cid, const xqc_cid_t *new_cid,
 									   void *user_data) {
 }
@@ -162,20 +198,7 @@ void xqc_server_conn_handshake_finished(xqc_connection_t *conn, void *user_data,
 	cout << "conn handshake" << endl;
 }
 
-int xqc_server_stream_read_notify(xqc_stream_t *stream, void *user_data) {
-	//conn_ctx_t *ctx = (conn_ctx_t *)user_data;
-	char buffer[4096];
-	while (1)
-	{
-		uint8_t fin = 0;
-		ssize_t s = xqc_stream_recv(stream, (unsigned char*)buffer, sizeof(buffer), &fin);
-		if (s <= 0)
-			break;
-	}
-	return 0;
-}
-
-void xqc_send_full(xqc_stream_t *stream)
+static void xqc_send_full(xqc_stream_t *stream)
 {
 	int total = 0;
 	while (1)
@@ -189,24 +212,61 @@ void xqc_send_full(xqc_stream_t *stream)
 	//cout << "total:" << total << endl;
 }
 
+
+int xqc_server_stream_read_notify(xqc_stream_t *stream, void *user_data) {
+	if (user_data == NULL)
+		return 0;
+	stream_ctx_t*ctx = (stream_ctx_t *)user_data;
+	char buffer[4096];
+	while (1)
+	{
+		uint8_t fin = 0;
+		ssize_t s = xqc_stream_recv(stream, (unsigned char*)buffer, sizeof(buffer), &fin);
+		if (s <= 0)
+			break;
+		if (ctx->state == 0) // header
+		{
+			if (buffer[0] == 0x11) // client send, server recv
+			{
+				ctx->write = false;
+			}
+			else
+			{
+				ctx->write = true;
+				xqc_send_full(ctx->stream);
+			}
+			ctx->state = 1;
+		}
+	}
+	return 0;
+}
+
 int xqc_server_stream_write_notify(xqc_stream_t *stream, void *user_data) {
 	//cout << "===" << endl;
-	//conn_ctx_t *ctx = (conn_ctx_t *)user_data;
-	xqc_send_full(stream);
+	if (user_data == NULL)
+		return 0;
+	stream_ctx_t* stream_ctx = (stream_ctx_t*)user_data;
+	if (stream_ctx->write)
+		xqc_send_full(stream);
 	return 0;
 }
 
 int xqc_server_stream_create_notify(xqc_stream_t *stream, void *user_data) {
 	cout << "new stream" << endl;
 	conn_ctx_t* ctx = (conn_ctx_t*)xqc_get_conn_user_data_by_stream(stream);
-	ctx->stream = stream;
-	xqc_stream_set_user_data(stream, ctx);
-	xqc_send_full(stream);
+	stream_ctx_t* stream_ctx = new stream_ctx_t();
+	stream_ctx->stream = stream;
+	stream_ctx->conn_ctx = ctx;
+	xqc_stream_set_user_data(stream, stream_ctx);
 	return 0;
 }
 
 int xqc_server_stream_close_notify(xqc_stream_t *stream, void *user_data) {
 	cout << "stream close" << endl;
+	stream_ctx_t* stream_ctx = (stream_ctx_t*)user_data;
+	xqc_stream_set_user_data(stream, NULL);
+	xqc_stream_close(stream);
+	delete stream_ctx;
 	return 0;
 }
 
@@ -233,7 +293,7 @@ int xqc_server_create_socket(server_ctx_t *ctx) {
 
 	memset(saddr, 0, sizeof(struct sockaddr_in));
 	addr_v4->sin_family = AF_INET;
-	addr_v4->sin_port = htons(9001);
+	addr_v4->sin_port = htons(9008);
 	addr_v4->sin_addr.s_addr = htonl(INADDR_ANY);
 	if (bind(ctx->fd, saddr, ctx->local_addr_len) < 0) {
 		cout << "bind socket failed, errno: " << get_sys_errno() << endl;
@@ -272,6 +332,7 @@ int xqc_server_create_engine(server_ctx_t *ctx, const char *priv_key_file, const
 	xqc_transport_callbacks_t transport_cbs = {
 			.server_accept = xqc_server_accept,
 			.write_socket = xqc_server_write_socket,
+			.write_mmsg = xqc_server_write_mmsg,
 			.conn_update_cid_notify = xqc_server_conn_update_cid_notify,
 	};
 
@@ -281,6 +342,7 @@ int xqc_server_create_engine(server_ctx_t *ctx, const char *priv_key_file, const
 		return -1;
 	}
 	//config.cfg_log_level = log_level;
+	config.sendmmsg_on = 1;
 
 	ctx->engine = xqc_engine_create(XQC_ENGINE_SERVER, &config, &ssl_cfg, &callback, &transport_cbs, ctx);
 	if (ctx->engine == NULL) {
@@ -335,9 +397,24 @@ int xqc_server_create_engine(server_ctx_t *ctx, const char *priv_key_file, const
 }
 
 int main(int argc, char *argv[]) {
+	bool reverse = false;
+	int result;
+	while ((result = getopt(argc, argv, "r")) != -1)
+	{
+		switch (result)
+		{
+			case 'r':
+				reverse = true;
+				break;
+			default:
+				break;
+		}
+	}
+
 	server_ctx_t *ctx = (server_ctx_t *) malloc(sizeof(server_ctx_t));
 	memset(ctx, 0, sizeof(server_ctx_t));
 	ctx->eb = event_base_new();
+	ctx->reverse = reverse;
 	ctx->ev_engine = event_new(ctx->eb, -1, 0, xqc_server_engine_callback, ctx);
 	if (xqc_server_create_socket(ctx) < 0)
 		return -1;

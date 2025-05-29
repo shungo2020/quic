@@ -27,14 +27,23 @@ static int get_sys_errno() {
 	return errno;
 }
 
+#define STAGE_CONNECT 	0
+#define STAGE_UPLOAD  	1
+#define STAGE_DELAY		2
+#define STAGE_DOWNLOAD	3
+#define STAGE_FINISHED 	4
+
 typedef struct client_ctx_s {
 	xqc_engine_t *engine;
 	struct event_base *eb;
 	struct event *ev_engine;
 	struct event *ev_timer;
+	struct event *ev_task_timer;
 
 	const xqc_cid_t *cid;
 	xqc_stream_t *stream;
+
+	int task_stage; // 0 connect 1: upload  2 delay 3 download 4 finished 
 
 	int fd;
 	struct event *ev_socket;
@@ -55,6 +64,8 @@ void xqc_client_set_event_timer(xqc_usec_t wake_after, void *user_data) {
 	tv.tv_sec = wake_after / 1000000;
 	tv.tv_usec = wake_after % 1000000;
 	event_add(ctx->ev_engine, &tv);
+	//uint64_t now = xqc_now();
+	//cout << "now:" << now << " w:" << uint64_t(wake_after + now) << endl;
 }
 
 void xqc_keylog_cb(const xqc_cid_t *scid, const char *line, void *user_data) {
@@ -110,6 +121,21 @@ int xqc_client_conn_close_notify(xqc_connection_t *conn, const xqc_cid_t *cid, v
 	return 0;
 }
 
+static void xqc_send_full(client_ctx_t* ctx, xqc_stream_t *stream)
+{
+	int total = 0;
+	while (1)
+	{
+		char buffer[4096];
+		ssize_t s = xqc_stream_send(stream, (unsigned char*)buffer, sizeof(buffer), 0);
+		if (s <= 0)
+			break;
+		total += s;
+		ctx->last_recv_bytes += s;
+	}
+	//cout << "total:" << total << endl;
+}
+
 int xqc_client_create_stream(client_ctx_t *ctx) {
 	xqc_stream_settings_t setting = {
 			.recv_rate_bytes_per_sec = 0,
@@ -119,17 +145,37 @@ int xqc_client_create_stream(client_ctx_t *ctx) {
 		cout << "create stream error" << endl;
 		return -1;
 	}
+
 	char buf[128];
+	if (ctx->task_stage == STAGE_UPLOAD)
+		buf[0] = 0x11;
+	else
+		buf[0] = 0xaa;
 	xqc_stream_send(ctx->stream, (unsigned char *) buf, sizeof(buf), 0);
+	
+	if (ctx->task_stage == STAGE_UPLOAD)
+	{
+		xqc_send_full(ctx, ctx->stream);
+		return 0;
+	}
 	return 0;
 }
 
 void xqc_client_conn_handshake_finished(xqc_connection_t *conn, void *user_data, void *conn_proto_data) {
-	cout << "conn handshake" << endl;
-	xqc_client_create_stream((client_ctx_t *) user_data);
+	cout << "conn handshake, start upload" << endl;
+	client_ctx_t* ctx = (client_ctx_t *)user_data;
+	ctx->task_stage = STAGE_UPLOAD;
+	struct timeval tv;
+	tv.tv_sec = 20;
+	tv.tv_usec = 0;
+	event_add(ctx->ev_task_timer, &tv);
+	xqc_client_create_stream(ctx);
 }
 
+
 int xqc_client_stream_read_notify(xqc_stream_t *stream, void *user_data) {
+	if (user_data == NULL)
+		return 0;
 	char buffer[2048];
 	uint8_t is_fin = 0;
 	client_ctx_t *ctx = (client_ctx_t *) user_data;
@@ -137,7 +183,8 @@ int xqc_client_stream_read_notify(xqc_stream_t *stream, void *user_data) {
 		ssize_t nread = xqc_stream_recv(ctx->stream, (unsigned char *) buffer, sizeof(buffer), &is_fin);
 		if (nread <= 0)
 			return 0;
-		ctx->last_recv_bytes += (uint32_t) nread;
+		if (ctx->task_stage == STAGE_DOWNLOAD)
+			ctx->last_recv_bytes += (uint32_t) nread;
 	}
 	return 0;
 }
@@ -148,6 +195,11 @@ int xqc_client_stream_close_notify(xqc_stream_t *stream, void *user_data) {
 }
 
 int xqc_client_stream_write_notify(xqc_stream_t *stream, void *user_data) {
+	if (user_data == NULL)
+		return 0;
+	client_ctx_t* ctx = (client_ctx_t *)user_data;
+	if (ctx->task_stage == STAGE_UPLOAD)
+		xqc_send_full(ctx, stream);
 	return 0;
 }
 
@@ -318,10 +370,10 @@ void get_current_time(char *now_time) {
 
 void xqc_client_timer(int fd, short what, void *arg) {
 	client_ctx_t *ctx = (client_ctx_t *) arg;
-	if (ctx->stream) {
+	/*if (ctx->stream && !ctx->reverse) {
 		char buf[128];
 		xqc_stream_send(ctx->stream, (unsigned char *) buf, sizeof(buf), 0);
-	}
+	}*/
 
 	char now_time[128];
 	get_current_time(now_time);
@@ -339,18 +391,76 @@ void xqc_client_timer(int fd, short what, void *arg) {
 	ctx->last_recv_bytes = 0;
 }
 
+void xqc_task_timer(int fd, short what, void *arg) {
+	client_ctx_t* ctx = (client_ctx_t*)arg;
+	switch (ctx->task_stage)
+	{
+	case STAGE_UPLOAD:
+		if (ctx->stream)
+		{
+			xqc_stream_set_user_data(ctx->stream, NULL);
+			xqc_stream_close(ctx->stream);
+			ctx->stream = NULL;
+			ctx->task_stage = STAGE_DELAY;
+			struct timeval tv;
+			tv.tv_sec = 10;
+			tv.tv_usec = 0;
+			event_add(ctx->ev_task_timer, &tv);
+			cout << "start delay ====" << endl;
+		}
+		break;
+	case STAGE_DELAY:
+		{
+			cout << "start download ====" << endl;
+			ctx->task_stage = STAGE_DOWNLOAD;
+			xqc_client_create_stream(ctx);
+		}
+		break;
+	case STAGE_DOWNLOAD:
+		break;
+	}
+}
+
 static void xqc_client_engine_callback(int fd, short what, void *arg) {
+	//cout << "now:" << uint64_t(xqc_now()) << endl;
 	client_ctx_t *ctx = (client_ctx_t *) arg;
 	xqc_engine_main_logic(ctx->engine);
 }
 
 int main(int argc, char *argv[]) {
-	const char *ip = "192.168.6.42";
-	//const char *ip = "127.0.0.1";
-	int port = 9001;
+	//std::string ip = "192.168.6.42";
+	//std::string ip = "127.0.0.1";
+	std::string ip = "161.35.30.59";
+	ip = "141.147.63.241";
+	int port = 9008;
+	bool reverse = false;
+
+	int result;
+	while ((result = getopt(argc, argv, "s:p:lr")) != -1)
+	{
+		switch (result)
+		{
+			case 'l':
+				ip = "192.168.6.42";
+				break;
+			case 's':
+				ip = optarg;
+				break;
+			case 'p':
+				port = atoi(optarg);
+				break;
+			case 'r':
+				reverse = true;
+				break;
+			default:
+				break;
+		}
+	}
 
 	client_ctx_t *ctx = (client_ctx_t *) malloc(sizeof(client_ctx_t));
 	memset(ctx, 0, sizeof(client_ctx_t));
+	//ctx->reverse = reverse;
+	ctx->task_stage = STAGE_CONNECT;
 	ctx->eb = event_base_new();
 	ctx->ev_engine = event_new(ctx->eb, -1, 0, xqc_client_engine_callback, ctx);
 
@@ -360,7 +470,8 @@ int main(int argc, char *argv[]) {
 	if (xqc_client_create_engine(ctx) < 0)
 		return -1;
 
-	if (xqc_client_create_conn(ctx, ip, port) < 0)
+	cout << "connect " << ip << ":" << port << endl;
+	if (xqc_client_create_conn(ctx, ip.c_str(), port) < 0)
 		return -1;
 
 	// start speed timer
@@ -369,6 +480,8 @@ int main(int argc, char *argv[]) {
 	tv.tv_sec = 1;
 	tv.tv_usec = 0;
 	event_add(ctx->ev_timer, &tv);
+
+	ctx->ev_task_timer = event_new(ctx->eb, -1, EV_TIMEOUT, xqc_task_timer, ctx);
 
 	event_base_dispatch(ctx->eb);
 
